@@ -14,12 +14,20 @@ const E2E_ENABLED = process.env.E2E === "1";
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
+function requireEnv(name: string): string {
+  const val = process.env[name];
+  if (!val && E2E_ENABLED) {
+    throw new Error(
+      `Missing required env var ${name}. ` +
+        `Copy .env.example to .env and fill in your credentials, then run: make e2e`,
+    );
+  }
+  return val || "";
+}
+
 const CFG = {
-  authToken:
-    process.env.E2E_AUTH_TOKEN ||
-    "68532defd56040d497a48eea760f0ddd.m68WU5TI4QaoivPO",
-  baseUrl:
-    process.env.E2E_BASE_URL || "https://api.z.ai/api/anthropic",
+  authToken: requireEnv("E2E_AUTH_TOKEN"),
+  baseUrl: process.env.E2E_BASE_URL || "https://api.z.ai/api/anthropic",
   apiTimeout: process.env.E2E_API_TIMEOUT_MS || "3000000",
   model: process.env.E2E_MODEL || "sonnet",
   spawnWaitMs: 15_000,
