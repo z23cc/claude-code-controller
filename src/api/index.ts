@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import type { ClaudeCodeController } from "../controller.js";
 import { ActionTracker } from "./action-tracker.js";
 import { buildRoutes } from "./routes.js";
@@ -9,10 +10,13 @@ import type { CreateApiOptions } from "./types.js";
  *
  * **Mode 1 – Pre-initialized controller:**
  * Pass an already-initialized controller. The API is ready to use immediately.
+ * The API will NOT shut down the controller when `POST /session/shutdown` is called
+ * (caller retains ownership).
  *
  * **Mode 2 – Lazy init via API:**
  * Pass no controller (or `null`). Use `POST /session/init` to create a session,
  * passing `env`, `teamName`, `cwd`, etc. in the request body.
+ * The API owns the controller lifecycle and will shut it down on session end.
  *
  * @example
  * ```ts
@@ -40,19 +44,31 @@ export function createApi(
     tracker.attach(controller);
   }
 
-  const state = { controller: controller ?? null, tracker };
+  const state = {
+    controller: controller ?? null,
+    tracker,
+    owned: false, // externally-provided controllers are not owned by the API
+    initLock: false,
+    startTime: Date.now(),
+  };
 
   const app = new Hono();
-  const routes = buildRoutes(state);
   const basePath = options?.basePath ?? "/";
 
+  // CORS: enabled by default, disable with { cors: false }
+  if (options?.cors !== false) {
+    app.use("*", cors());
+  }
+
+  const routes = buildRoutes(state);
   app.route(basePath, routes);
 
-  // Global error handler
+  // Global error handler — returns 400 for validation errors, 500 for the rest
   app.onError((err, c) => {
     const message =
       err instanceof Error ? err.message : "Internal server error";
-    return c.json({ error: message }, 500);
+    const status = err.name === "ValidationError" ? 400 : 500;
+    return c.json({ error: message }, status);
   });
 
   return app;

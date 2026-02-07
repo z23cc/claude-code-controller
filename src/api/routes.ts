@@ -13,11 +13,36 @@ import type {
   AssignTaskBody,
 } from "./types.js";
 
-const startTime = Date.now();
+// ─── Validation ──────────────────────────────────────────────────────────────
+
+const SAFE_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+function validateName(value: string, field: string): void {
+  if (!SAFE_NAME_RE.test(value)) {
+    throw new ValidationError(
+      `${field} must be 1-64 alphanumeric characters, hyphens, or underscores`
+    );
+  }
+}
+
+class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
+
+// ─── State ───────────────────────────────────────────────────────────────────
 
 export interface ApiState {
   controller: ClaudeCodeController | null;
   tracker: ActionTracker;
+  /** True if the controller was created via POST /session/init (API owns lifecycle). */
+  owned: boolean;
+  /** Prevents concurrent session init/shutdown. */
+  initLock: boolean;
+  /** Timestamp of when this API instance was created. */
+  startTime: number;
 }
 
 function getController(state: ApiState): ClaudeCodeController {
@@ -29,6 +54,8 @@ function getController(state: ApiState): ClaudeCodeController {
   return state.controller;
 }
 
+// ─── Routes ──────────────────────────────────────────────────────────────────
+
 export function buildRoutes(state: ApiState) {
   const api = new Hono();
 
@@ -37,7 +64,7 @@ export function buildRoutes(state: ApiState) {
   api.get("/health", (c) => {
     return c.json({
       status: "ok",
-      uptime: Date.now() - startTime,
+      uptime: Date.now() - state.startTime,
       session: state.controller !== null,
     });
   });
@@ -55,38 +82,70 @@ export function buildRoutes(state: ApiState) {
   });
 
   api.post("/session/init", async (c) => {
-    const body = await c.req.json<InitSessionBody>().catch(() => ({} as InitSessionBody));
-
-    // Shutdown existing session if any
-    if (state.controller) {
-      state.tracker.clear();
-      await state.controller.shutdown();
-      state.controller = null;
+    if (state.initLock) {
+      return c.json({ error: "Session init already in progress" }, 409);
     }
+    state.initLock = true;
 
-    const controller = new ClaudeCodeController({
-      teamName: body.teamName,
-      cwd: body.cwd,
-      claudeBinary: body.claudeBinary,
-      env: body.env,
-      logLevel: "info",
-    });
+    try {
+      const body = await c.req.json<InitSessionBody>().catch(() => ({} as InitSessionBody));
 
-    await controller.init();
-    state.controller = controller;
-    state.tracker.attach(controller);
+      // Validate names
+      if (body.teamName) validateName(body.teamName, "teamName");
 
-    return c.json({
-      initialized: true,
-      teamName: controller.teamName,
-    }, 201);
+      // Shutdown existing session if owned by us
+      const oldController = state.controller;
+      if (oldController) {
+        state.tracker.clear();
+        state.controller = null;
+        if (state.owned) {
+          await oldController.shutdown();
+        }
+      }
+
+      const controller = new ClaudeCodeController({
+        teamName: body.teamName,
+        cwd: body.cwd,
+        claudeBinary: body.claudeBinary,
+        env: body.env,
+        logLevel: body.logLevel ?? "info",
+      });
+
+      try {
+        await controller.init();
+      } catch (err) {
+        // Cleanup the partially-initialized controller
+        try { await controller.shutdown(); } catch { /* best effort */ }
+        throw err;
+      }
+
+      state.controller = controller;
+      state.owned = true;
+      state.tracker.attach(controller);
+
+      return c.json({
+        initialized: true,
+        teamName: controller.teamName,
+      }, 201);
+    } finally {
+      state.initLock = false;
+    }
   });
 
   api.post("/session/shutdown", async (c) => {
+    if (state.initLock) {
+      return c.json({ error: "Session init in progress" }, 409);
+    }
+
     const ctrl = getController(state);
     state.tracker.clear();
-    await ctrl.shutdown();
     state.controller = null;
+
+    if (state.owned) {
+      await ctrl.shutdown();
+    }
+
+    state.owned = false;
     return c.json({ ok: true });
   });
 
@@ -115,7 +174,7 @@ export function buildRoutes(state: ApiState) {
   });
 
   api.get("/actions/approvals", (_c) => {
-    getController(state); // ensure session exists
+    getController(state);
     return _c.json(state.tracker.getPendingApprovals());
   });
 
@@ -135,7 +194,7 @@ export function buildRoutes(state: ApiState) {
   });
 
   api.get("/actions/idle-agents", (_c) => {
-    getController(state); // ensure session exists
+    getController(state);
     return _c.json(state.tracker.getIdleAgents());
   });
 
@@ -161,6 +220,7 @@ export function buildRoutes(state: ApiState) {
     if (!body.name) {
       return c.json({ error: "name is required" }, 400);
     }
+    validateName(body.name, "name");
 
     const agentType = body.type || "general-purpose";
     state.tracker.registerAgentType(body.name, agentType);
@@ -292,35 +352,33 @@ export function buildRoutes(state: ApiState) {
   api.get("/tasks/:id", async (c) => {
     const ctrl = getController(state);
     const id = c.req.param("id");
-    try {
-      const task = await ctrl.tasks.get(id);
-      return c.json(task);
-    } catch {
+    const task = await ctrl.tasks.get(id).catch(() => null);
+    if (!task) {
       return c.json({ error: `Task "${id}" not found` }, 404);
     }
+    return c.json(task);
   });
 
   api.patch("/tasks/:id", async (c) => {
     const ctrl = getController(state);
     const id = c.req.param("id");
     const body = await c.req.json<UpdateTaskBody>();
-    try {
-      const task = await ctrl.tasks.update(id, body);
-      return c.json(task);
-    } catch {
+    const task = await ctrl.tasks.update(id, body).catch(() => null);
+    if (!task) {
       return c.json({ error: `Task "${id}" not found` }, 404);
     }
+    return c.json(task);
   });
 
   api.delete("/tasks/:id", async (c) => {
     const ctrl = getController(state);
     const id = c.req.param("id");
-    try {
-      await ctrl.tasks.delete(id);
-      return c.json({ ok: true });
-    } catch {
+    const exists = await ctrl.tasks.get(id).catch(() => null);
+    if (!exists) {
       return c.json({ error: `Task "${id}" not found` }, 404);
     }
+    await ctrl.tasks.delete(id);
+    return c.json({ ok: true });
   });
 
   api.post("/tasks/:id/assign", async (c) => {
@@ -330,12 +388,12 @@ export function buildRoutes(state: ApiState) {
     if (!body.agent) {
       return c.json({ error: "agent is required" }, 400);
     }
-    try {
-      await ctrl.assignTask(id, body.agent);
-      return c.json({ ok: true });
-    } catch {
+    const exists = await ctrl.tasks.get(id).catch(() => null);
+    if (!exists) {
       return c.json({ error: `Task "${id}" not found` }, 404);
     }
+    await ctrl.assignTask(id, body.agent);
+    return c.json({ ok: true });
   });
 
   return api;

@@ -1,4 +1,4 @@
-import type { AgentType, TaskStatus } from "../types.js";
+import type { AgentType, LogLevel, TaskStatus } from "../types.js";
 
 // ─── Request Bodies ──────────────────────────────────────────────────────────
 
@@ -7,6 +7,7 @@ export interface InitSessionBody {
   cwd?: string;
   claudeBinary?: string;
   env?: Record<string, string>;
+  logLevel?: LogLevel;
 }
 
 export interface SpawnAgentBody {
@@ -114,4 +115,10 @@ export interface CreateApiOptions {
    * Defaults to "/" (no prefix).
    */
   basePath?: string;
+  /**
+   * CORS configuration.
+   * - `true` (default): enable CORS with permissive defaults (origin: *)
+   * - `false`: disable CORS entirely
+   */
+  cors?: boolean;
 }

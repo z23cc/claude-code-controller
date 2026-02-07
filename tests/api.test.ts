@@ -879,4 +879,169 @@ describe("createApi /actions", () => {
     expect(body.unassignedTasks).toHaveLength(1);
     expect(body.idleAgents).toHaveLength(1);
   });
+
+  // ─── Stale approvals cleanup on agent exit ─────────────────────────
+
+  it("agent exit clears stale approvals for that agent", async () => {
+    // Create a pending plan approval
+    const planMsg = JSON.stringify({
+      type: "plan_approval_request",
+      requestId: "plan-stale",
+      from: "deadagent",
+      planContent: "Will never complete",
+      timestamp: new Date().toISOString(),
+    });
+    await writeInbox(teamName, "controller", {
+      from: "deadagent",
+      text: planMsg,
+      timestamp: new Date().toISOString(),
+    });
+    // @ts-expect-error accessing private
+    await ctrl.poller.poll();
+
+    let res = await app.request("/actions");
+    let body = await res.json();
+    expect(body.approvals).toHaveLength(1);
+
+    // Simulate agent exit
+    ctrl.emit("agent:exited", "deadagent", 1);
+
+    res = await app.request("/actions");
+    body = await res.json();
+    expect(body.approvals).toHaveLength(0);
+  });
+});
+
+// ─── Validation / Security ───────────────────────────────────────────────────
+
+describe("createApi validation", () => {
+  it("POST /session/init rejects path traversal in teamName", async () => {
+    const app = createApi();
+    const res = await app.request("/session/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ teamName: "../../etc" }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("teamName");
+  });
+
+  it("POST /session/init rejects dots in teamName", async () => {
+    const app = createApi();
+    const res = await app.request("/session/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ teamName: "foo.bar" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /agents rejects path traversal in name", async () => {
+    const teamName = `val-${randomUUID().slice(0, 8)}`;
+    const ctrl = new ClaudeCodeController({ teamName, logLevel: "silent" });
+    await ctrl.init();
+    const app = createApi(ctrl);
+
+    const res = await app.request("/agents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "../controller" }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("name");
+
+    await ctrl.shutdown();
+  });
+
+  it("POST /session/init accepts valid names with hyphens and underscores", async () => {
+    const app = createApi();
+    const res = await app.request("/session/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ teamName: "my-team_01" }),
+    });
+    // Should succeed (valid name)
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.teamName).toBe("my-team_01");
+
+    await app.request("/session/shutdown", { method: "POST" });
+  });
+});
+
+// ─── Mode 1 shutdown safety ──────────────────────────────────────────────────
+
+describe("createApi Mode 1 shutdown safety", () => {
+  it("POST /session/shutdown does NOT shut down externally-provided controller", async () => {
+    const teamName = `m1-${randomUUID().slice(0, 8)}`;
+    const ctrl = new ClaudeCodeController({ teamName, logLevel: "silent" });
+    await ctrl.init();
+    const app = createApi(ctrl);
+
+    // Shutdown via API
+    const res = await app.request("/session/shutdown", { method: "POST" });
+    expect(res.status).toBe(200);
+
+    // API should show no session
+    const session = await app.request("/session");
+    const body = await session.json();
+    expect(body.initialized).toBe(false);
+
+    // But the controller itself should still be functional
+    // (send should not throw "Controller not initialized")
+    await ctrl.send("test-agent", "hello");
+    const inbox = await readInbox(teamName, "test-agent");
+    expect(inbox).toHaveLength(1);
+
+    // Clean up ourselves
+    await ctrl.shutdown();
+  });
+});
+
+// ─── CORS ────────────────────────────────────────────────────────────────────
+
+describe("createApi CORS", () => {
+  it("includes CORS headers by default", async () => {
+    const teamName = `cors-${randomUUID().slice(0, 8)}`;
+    const ctrl = new ClaudeCodeController({ teamName, logLevel: "silent" });
+    await ctrl.init();
+    const app = createApi(ctrl);
+
+    const res = await app.request("/health");
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+
+    await ctrl.shutdown();
+  });
+
+  it("cors: false disables CORS headers", async () => {
+    const teamName = `nocors-${randomUUID().slice(0, 8)}`;
+    const ctrl = new ClaudeCodeController({ teamName, logLevel: "silent" });
+    await ctrl.init();
+    const app = createApi(ctrl, { cors: false });
+
+    const res = await app.request("/health");
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
+
+    await ctrl.shutdown();
+  });
+});
+
+// ─── logLevel in session/init ────────────────────────────────────────────────
+
+describe("createApi logLevel", () => {
+  it("POST /session/init accepts logLevel", async () => {
+    const app = createApi();
+    const teamName = `log-${randomUUID().slice(0, 8)}`;
+
+    const res = await app.request("/session/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ teamName, logLevel: "silent" }),
+    });
+    expect(res.status).toBe(201);
+
+    await app.request("/session/shutdown", { method: "POST" });
+  });
 });
